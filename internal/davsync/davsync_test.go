@@ -706,3 +706,136 @@ func TestSyncPluginsAndSignIn(t *testing.T) {
 		t.Fatalf("b asked to install %v after a took its plugin away", asked)
 	}
 }
+
+// A part changed here a minute ago stays even though another computer
+// pushed a change it made an hour ago in between: the part's own time
+// decides, not the time the file was written, which every push moves to
+// now. Before Revised, the server's whole file counted as "changed now" the
+// moment anything was pushed over it, so an hour-old change there won every
+// conflict with a newer one here, and the newer one was replaced (a
+// computer that synced at 00:37 lost the keys it had entered that evening
+// to one that had pushed at 23:28).
+func TestSyncPartChangedHereIsNewerThanAnOldPushThere(t *testing.T) {
+	fake := &fakeDAV{files: map[string][]byte{}, etags: map[string]string{}, dirs: map[string]bool{"/dav": true}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	ctx := context.Background()
+	cfg := Config{URL: srv.URL + "/dav", User: "me", Password: "pw", Passphrase: "p", Keys: true}
+	now := func(t *testing.T) {
+		t.Helper()
+		if err := Now(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b := newComputer(t), newComputer(t)
+	a.use(t)
+	provider.Save(provider.Provider{ID: "one", Name: "One", Chat: "https://x/v1", Key: "k1"})
+	if err := Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	now(t)
+
+	// b joins and changes the providers an hour ago, then pushes it now:
+	// the file says it was written a moment ago
+	b.use(t)
+	if err := Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	now(t)
+	p, err := provider.Find("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Keys = []provider.KeyAccount{{Name: "theirs", Key: "k2"}}
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	hour := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(provider.Path(), hour, hour); err != nil {
+		t.Fatal(err)
+	}
+	now(t)
+
+	// a changes its own providers a minute ago, after that push
+	a.use(t)
+	p, err = provider.Find("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Keys = []provider.KeyAccount{{Name: "mine", Key: "k3"}}
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	minute := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(provider.Path(), minute, minute); err != nil {
+		t.Fatal(err)
+	}
+	if v := Status(); v.Notice != nil {
+		Dismiss()
+	}
+	now(t)
+	// the newer one here stays whole, and the server's is kept aside
+	got, err := provider.Find("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Keys) != 1 || got.Keys[0].Name != "mine" {
+		t.Fatalf("a's newer change lost to b's hour-old push: %+v", got.Keys)
+	}
+	if n := Status().Notice; n == nil || !slices.Equal(n.There, []string{"providers"}) {
+		t.Fatalf("notice: %+v", n)
+	}
+	// …and b, whose change was the older, follows it
+	b.use(t)
+	now(t)
+	got, err = provider.Find("one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Keys) != 1 || got.Keys[0].Name != "mine" {
+		t.Fatalf("b didn't follow a's newer change: %+v", got.Keys)
+	}
+}
+
+// A part no push touched keeps the time it had: writing the file for
+// another part moves Created, never Revised, so a change here three minutes
+// old still wins against a file written a second ago.
+func TestSyncKeepsThePartTimesAPushDidNotTouch(t *testing.T) {
+	fake := &fakeDAV{files: map[string][]byte{}, etags: map[string]string{}, dirs: map[string]bool{"/dav": true}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	ctx := context.Background()
+	cfg := Config{URL: srv.URL + "/dav", User: "me", Password: "pw", Passphrase: "p", Keys: true}
+	newComputer(t).use(t)
+	provider.Save(provider.Provider{ID: "one", Name: "One", Chat: "https://x/v1", Key: "k1"})
+	if err := Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := Now(ctx); err != nil {
+		t.Fatal(err)
+	}
+	at := func() map[string]time.Time {
+		t.Helper()
+		b, err := backup.Open(fake.files["/dav/magpie/magpie.magpie-backup"], "p")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Revised == nil {
+			t.Fatalf("a push wrote no part times")
+		}
+		return b.Revised
+	}
+	first := at()
+	// the settings change: providers keeps its time, settings moves
+	settings.Save(settings.Settings{Theme: "dark"})
+	if err := Now(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second := at()
+	if !second["providers"].Equal(first["providers"]) {
+		t.Fatalf("providers' time moved for a settings change: %v then %v", first["providers"], second["providers"])
+	}
+	if !second["settings"].After(first["settings"]) {
+		t.Fatalf("settings' time didn't move: %v then %v", first["settings"], second["settings"])
+	}
+}

@@ -920,6 +920,39 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 	to.Version = backup.BundleVersion // the merged bundle is a sync one, whatever the server's file was
 }
 
+// revised is the parts of b as the sync wrote them, with when each part
+// last changed: one taken from here takes the time its own files changed
+// (changed), and one left as the server had it keeps the time it had there
+// (had's Revised, or Created for a part an older file has no time for).
+// Created alone can't say this: every push moves it to now, so a part
+// changed here a minute ago lost to one changed on another computer an
+// hour ago, pushed since.
+func revised(b *backup.Bundle, mine []string, had backup.Bundle, keys bool, now time.Time) {
+	switch {
+	case b.Revised == nil:
+		b.Revised = map[string]time.Time{}
+	default:
+		b.Revised = maps.Clone(b.Revised) // the caller's bundle may be the server's
+	}
+	from := map[string]bool{}
+	for _, p := range mine {
+		from[p] = true
+	}
+	for _, p := range Parts {
+		if !from[p] {
+			if _, ok := b.Revised[p]; !ok {
+				b.Revised[p] = had.Created
+			}
+			continue
+		}
+		if t := changed(p, keys).UTC(); !t.IsZero() {
+			b.Revised[p] = t
+		} else {
+			b.Revised[p] = now
+		}
+	}
+}
+
 // changed is when a part was last changed here, as its files say.
 func changed(part string, keys bool) time.Time {
 	mtime := func(p string) time.Time {
@@ -1079,9 +1112,12 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	etag := ver.ETag
 	rebuilt := false // a damaged server file replaced by this computer's merge
 	// push writes b over etag; were, as the parts on the server and here
-	// were before it, is kept when the write is blind
-	push := func(b backup.Bundle, etag string, were blind) error {
+	// were before it, is kept when the write is blind. mine are the parts
+	// taken from this computer, had the file it replaces: the others keep
+	// the time the server had for them.
+	push := func(b backup.Bundle, etag string, were blind, mine []string, had backup.Bundle) error {
 		b.Created, b.App = time.Now().UTC(), "magpie"
+		revised(&b, mine, had, c.Keys, b.Created)
 		sealed, err := backup.Seal(b, c.Passphrase)
 		if err != nil {
 			return err
@@ -1099,7 +1135,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 		return nil
 	}
 	if data == nil { // nothing there yet: this computer's setup is the first
-		if err := push(local, "", blind{}); err != nil {
+		if err := push(local, "", blind{}, Parts, backup.Bundle{}); err != nil {
 			return err
 		}
 		st.Local = L
@@ -1170,13 +1206,16 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	R := hashes(remote)
 	first := st.Local == nil
 	merged := remote
-	var bringIn, here, there []string
+	// mine are the parts this computer's copy goes up with, conflict or not:
+	// they are the ones whose time is this computer's files'
+	var mine, bringIn, here, there []string
 	for _, p := range Parts {
 		if L[p] == R[p] || (p == "agents" && !c.Agents) || (p == "library" && !c.library()) {
 			continue
 		}
 		if p == "library" && remote.Library == nil { // from a magpie before the library went: this computer's goes up
 			take(&merged, local, p)
+			mine = append(mine, p)
 			continue
 		}
 		lc := !first && L[p] != st.Local[p]
@@ -1184,6 +1223,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 		switch {
 		case lc && !rc:
 			take(&merged, local, p)
+			mine = append(mine, p)
 		case rc && !lc:
 			if first && p == "settings" {
 				keepUnseenGatewayKeys(&remote, local)
@@ -1193,8 +1233,15 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 				here = append(here, p)
 			}
 		case lc && rc: // both: the newer stays
-			if changed(p, c.Keys).After(remote.Created) {
+			// the part's own time, not the file's: Created is when the file
+			// was written, and every push writes it anew
+			at, ok := remote.Revised[p]
+			if !ok { // from a magpie before the times, or a backup file
+				at = remote.Created
+			}
+			if changed(p, c.Keys).UTC().After(at) {
 				take(&merged, local, p)
+				mine = append(mine, p)
 				there = append(there, p)
 			} else {
 				bringIn = append(bringIn, p)
@@ -1247,7 +1294,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	// A rebuild always writes back: the server's file is the damaged one,
 	// so even a merge that matches the cached copy must replace it.
 	if rebuilt || !maps.Equal(M, R) {
-		if err := push(merged, etag, blind{Remote: R, Local: pending}); err != nil {
+		if err := push(merged, etag, blind{Remote: R, Local: pending}, mine, remote); err != nil {
 			return err
 		}
 	}

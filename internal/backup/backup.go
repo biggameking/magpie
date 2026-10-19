@@ -63,8 +63,15 @@ func isBackupJSON(data []byte) bool {
 
 // Bundle is what a backup holds.
 type Bundle struct {
-	Version     int                        `json:"version"`
-	Created     time.Time                  `json:"created"`
+	Version int       `json:"version"`
+	Created time.Time `json:"created"`
+	// Revised is when each part last changed, by the sync that wrote it: a
+	// part keeps the time it had until its content changes. Created is when
+	// the file was written, which every push moves to now, so a sync that
+	// finds a part changed on both sides must compare Revised to tell which
+	// change is newer. Absent from a backup file and from a magpie before
+	// it, where Created stands for every part.
+	Revised     map[string]time.Time       `json:"revised,omitempty"`
 	App         string                     `json:"app,omitempty"` // the magpie that made it
 	Keys        bool                       `json:"keys"`          // whole-backup credential policy
 	Providers   []provider.Provider        `json:"providers"`

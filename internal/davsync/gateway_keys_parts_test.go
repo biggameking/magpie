@@ -161,8 +161,12 @@ func TestGatewayKeysConflict(t *testing.T) {
 				base := time.Now().Add(-3 * time.Hour)
 				keyTime := base.Add(time.Hour)
 				remote.Created = base.Add(2 * time.Hour)
+				// the settings part's own time, which is what the merge reads:
+				// Created is when the file was written, not when the part changed
+				remote.Revised = map[string]time.Time{"settings": remote.Created}
 				if localNewer {
 					keyTime, remote.Created = remote.Created, keyTime
+					remote.Revised["settings"] = remote.Created
 				}
 				for file, changed := range map[string]time.Time{settings.Path(): base, access.Path(): keyTime} {
 					if err := os.Chtimes(file, changed, changed); err != nil {
